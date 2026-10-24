@@ -221,6 +221,28 @@ func TestProcessNextDeleteConfirmation_StopsOnShutdown(t *testing.T) {
 	assert.Empty(t, ch)
 }
 
+func TestConfirmDelete_DoesNotBlockAfterGopherStops(t *testing.T) {
+	scout, _ := newDeleteConfirmationTestScout(omefake.NewSimpleClientset())
+	scout.gopherChan = make(chan *GopherTask)
+	stop := make(chan struct{})
+	close(stop)
+	scout.deleteWorkerStop = stop
+	defer scout.deleteQueue.ShutDown()
+
+	done := make(chan struct{})
+	go func() {
+		scout.confirmDelete(deleteConfirmation{baseModel: &v1beta1.BaseModel{
+			ObjectMeta: metav1.ObjectMeta{Name: "gone", Namespace: "models"},
+		}})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("delete confirmation blocked on the stopped gopher")
+	}
+}
+
 func TestGetWithTimeout_BoundsRead(t *testing.T) {
 	const timeout = 10 * time.Millisecond
 	var hadDeadline bool

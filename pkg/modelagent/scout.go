@@ -45,6 +45,7 @@ type Scout struct {
 	kubeClient             *kubernetes.Clientset
 	omeClient              omev1beta1client.Interface
 	deleteQueue            workqueue.TypedRateLimitingInterface[deleteConfirmation]
+	deleteWorkerStop       <-chan struct{}
 	logger                 *zap.SugaredLogger
 }
 
@@ -227,8 +228,24 @@ func (w *Scout) Run(stopCh <-chan struct{}) error {
 	w.startupStopCh = stopCh
 
 	w.logger.Info("Starting scout")
-	defer w.deleteQueue.ShutDown()
-	go w.runDeleteConfirmationWorker()
+	deleteWorkerDone := make(chan struct{})
+	deleteWorkerStop := make(chan struct{})
+	w.deleteWorkerStop = deleteWorkerStop
+	workerStopped := false
+	stopDeleteWorker := func() {
+		if workerStopped {
+			return
+		}
+		workerStopped = true
+		close(deleteWorkerStop)
+		w.deleteQueue.ShutDown()
+		<-deleteWorkerDone
+	}
+	defer stopDeleteWorker()
+	go func() {
+		defer close(deleteWorkerDone)
+		w.runDeleteConfirmationWorker()
+	}()
 
 	w.logger.Info("Starting informer cache")
 	go w.informerFactory.Start(stopCh)
@@ -316,7 +333,7 @@ syncComplete:
 	w.reconcilePendingDeletions()
 
 	<-stopCh
-	w.deleteQueue.ShutDown()
+	stopDeleteWorker()
 	close(w.gopherChan)
 	w.logger.Info("Shutting down scout")
 
@@ -660,10 +677,17 @@ func (w *Scout) confirmDelete(item deleteConfirmation) {
 		return
 	}
 	w.deleteQueue.Forget(item)
+	// The worker must not block on a gopher that has already stopped, and Run
+	// waits for this handoff before closing the channel.
+	var task *GopherTask
 	if item.baseModel != nil {
-		w.deleteBaseModel(item.baseModel)
+		task = &GopherTask{TaskType: Delete, BaseModel: item.baseModel}
 	} else {
-		w.deleteClusterBaseModel(item.clusterBaseModel)
+		task = &GopherTask{TaskType: Delete, ClusterBaseModel: item.clusterBaseModel}
+	}
+	select {
+	case w.gopherChan <- task:
+	case <-w.deleteWorkerStop:
 	}
 }
 
